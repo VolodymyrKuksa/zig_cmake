@@ -10,7 +10,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    prepareExternal() catch |err| std.debug.panic("Failed to prepare external: {}", .{err});
+    prepareExternal(b.build_root.handle) catch |err| {
+        std.debug.panic("Failed to prepare external: {}", .{err});
+    };
 
     const sc_mod = b.addModule("SDL_shadercross", .{
         .target = target,
@@ -79,12 +81,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 }
 
-fn prepareExternal() !void {
+fn prepareExternal(build_root: std.fs.Dir) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
     // TODO: use
-    var vendor_dir = try std.fs.cwd().openDir("vendor", .{});
+    var vendor_dir = try build_root.openDir("vendor", .{});
     defer vendor_dir.close();
 
     // Debug
@@ -92,13 +94,13 @@ fn prepareExternal() !void {
     defer gpa.allocator().free(vendor_path);
     std.debug.print("vendor path: {s}\n", .{vendor_path});
 
-    std.fs.cwd().makePath("external") catch |err| {
+    build_root.makePath("external") catch |err| {
         switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         }
     };
-    var external_dir = try std.fs.cwd().openDir("external", .{});
+    var external_dir = try build_root.openDir("external", .{});
     defer external_dir.close();
 
     var vendor_version = try vendor_dir.openFile("version.txt", .{});

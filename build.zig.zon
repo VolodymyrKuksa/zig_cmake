@@ -6,10 +6,13 @@
     .fingerprint = 0xe305038f38e6d211,
     .minimum_zig_version = "0.14.0",
 
+    // Should I just place the vendored deps here??
     .dependencies = .{
     },
 
     .paths = .{
+        ".git", // needed to fetch vendored dependencies
+        ".gitmodules", // needed to fetch vendored dependencies
         "build.zig",
         "build.zig.zon",
         "src",
