@@ -1,0 +1,18 @@
+.{
+    .name = .test_submod,
+
+    .version = "0.0.0",
+
+    .fingerprint = 0xe305038f38e6d211,
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor/version.txt",
+    },
+}
