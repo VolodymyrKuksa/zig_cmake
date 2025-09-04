@@ -1,6 +1,9 @@
 const std = @import("std");
 
 // What happens if this is imported like a zig dependency?
+// TODO: The git submodules cannot be fetched if we publish this module as zig dependency.
+// Try adding the vendored dependencies via 'zig fetch --save=name url' instead.
+
 // How to properly package the executable and libraries to ship to other users?
 
 pub fn build(b: *std.Build) void {
