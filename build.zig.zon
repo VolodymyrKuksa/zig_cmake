@@ -11,7 +11,7 @@
     },
 
     .paths = .{
-        ".git", // needed to fetch vendored dependencies
+        ".git/", // needed to fetch vendored dependencies
         ".gitmodules", // needed to fetch vendored dependencies
         "build.zig",
         "build.zig.zon",
