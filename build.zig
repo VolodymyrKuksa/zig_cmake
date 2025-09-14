@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // What happens if this is imported like a zig dependency?
 // TODO: The git submodules cannot be fetched if we publish this module as zig dependency.
@@ -6,12 +7,42 @@ const std = @import("std");
 
 // How to properly package the executable and libraries to ship to other users?
 
+// The idea is to generate and compile CMake dependencies when build.zig is invoked.
+// Steps:
+// - Grab hashes of the dependencies from the std.Build instance
+// - If hashes are up to date (match the ones in version.txt) skip to the zig module creation step
+// - Create build directory inside the fetched dependency (or in the current mosule subdir)
+// - Generate CMake projects for all needed targets and optimization options
+// - Build CMake generated projects
+// - Write dependency hashes into a version file to avoid recompilation next time
+// - Create zig module that linkes against the pre-built CMake dependencies
+
 pub fn build(b: *std.Build) void {
     std.debug.print("install prefix: \"{s}\"\n", .{b.install_prefix});
     std.debug.print("build root: \"{?s}\"\n", .{b.build_root.path});
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const sdl_dep = b.dependency("sdl", .{ .target = target, .optimize = optimize });
+    const sdl_dep_path = sdl_dep.path(".").getPath(b);
+    std.debug.print("SDL Dependency path: {s}\n", .{sdl_dep_path});
+
+    std.debug.print("Dependency hashes:\n", .{});
+    for (b.available_deps) |dep| {
+        std.debug.print("{s:>20}: {s}\n", .{ dep[0], dep[1] });
+    }
+
+    var ext_dir = b.build_root.handle.openDir("ext", .{}) catch unreachable;
+    defer ext_dir.close();
+
+    prepareExternalDeps(b, .{
+        .target = target,
+        .optimize = optimize,
+        .ext_dir = ext_dir,
+    }) catch |err| {
+        std.debug.panic("Failed to prepare external dependencies: {}", .{err});
+    };
 
     prepareExternal(b.build_root.handle) catch |err| {
         std.debug.panic("Failed to prepare external: {}", .{err});
@@ -82,6 +113,114 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+}
+
+const ExternalOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ext_dir: std.fs.Dir,
+};
+
+fn prepareExternalDeps(b: *std.Build, opts: ExternalOptions) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    try generateAndBuildSDL(gpa.allocator(), b, opts);
+}
+
+fn generateAndBuildSDL(allocator: std.mem.Allocator, b: *std.Build, opts: ExternalOptions) !void {
+    if (opts.target.result.os.tag != builtin.target.os.tag or
+        opts.target.result.cpu.arch != builtin.target.cpu.arch)
+    {
+        return error.CrossCompilationNotSupported;
+    }
+    const sdl_dep = b.dependency("sdl", .{});
+    const sdl_path = sdl_dep.path(".").getPath(b);
+    var sdl_dir = try std.fs.openDirAbsolute(sdl_path, .{});
+    defer sdl_dir.close();
+    const sdl_hash = try getDependencyHash(b, "sdl");
+    const triple = try opts.target.result.zigTriple(allocator);
+    defer allocator.free(triple);
+    const triple_mod = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+        triple,
+        @tagName(opts.optimize),
+    });
+    defer allocator.free(triple_mod);
+    var build_dir = blk: {
+        const relpath = try std.fmt.allocPrint(allocator, "build/{s}", .{triple_mod});
+        defer allocator.free(relpath);
+        sdl_dir.makePath(relpath) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        break :blk try sdl_dir.openDir(relpath, .{});
+    };
+    defer build_dir.close();
+    const build_path = try build_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(build_path);
+
+    const cmake_build_type = switch (opts.optimize) {
+        .Debug => "Debug",
+        .ReleaseFast => "Release",
+        .ReleaseSafe => "ReleaseWithDebInfo",
+        .ReleaseSmall => "MinSizeRel",
+    };
+    const cmake_build_type_option = try std.fmt.allocPrint(
+        allocator,
+        "-DCMAKE_BUILD_TYPE={s}",
+        .{cmake_build_type},
+    );
+    defer allocator.free(cmake_build_type_option);
+
+    var cmake_generate = std.process.Child.init(
+        &.{ "cmake", cmake_build_type_option, "-S", sdl_path, "-B", build_path },
+        allocator,
+    );
+    const generate_term = try cmake_generate.spawnAndWait();
+    if (std.meta.activeTag(generate_term) != .Exited or generate_term.Exited != 0) {
+        return error.CMakeGenerateFailed;
+    }
+
+    var cmake_build = std.process.Child.init(
+        &.{ "cmake", "--build", build_path, "-j", "16" },
+        allocator,
+    );
+    const build_term = try cmake_build.spawnAndWait();
+    if (std.meta.activeTag(build_term) != .Exited or build_term.Exited != 0) {
+        return error.CMakeBuildFailed;
+    }
+
+    try opts.ext_dir.deleteTree("SDL");
+
+    const ext_sdl_path = try std.fmt.allocPrint(allocator, "SDL/{s}", .{triple_mod});
+    defer allocator.free(ext_sdl_path);
+    const lib_path = try std.fmt.allocPrint(allocator, "{s}/lib", .{ext_sdl_path});
+    defer allocator.free(lib_path);
+    const inc_path = try std.fmt.allocPrint(allocator, "{s}/include/SDL3", .{ext_sdl_path});
+    defer allocator.free(inc_path);
+
+    try copyDir(allocator, build_dir, ".", opts.ext_dir, lib_path, .{
+        .include_extensions = &.{opts.target.result.dynamicLibSuffix()},
+        .verbose = true,
+    });
+    try copyDir(allocator, sdl_dir, "include/SDL3", opts.ext_dir, inc_path, .{
+        .verbose = true,
+        .recursive = true,
+    });
+
+    const hash_path = try std.fmt.allocPrint(allocator, "{s}/hash.txt", .{ext_sdl_path});
+    defer allocator.free(hash_path);
+    var hash_file = try opts.ext_dir.createFile(hash_path, .{});
+    defer hash_file.close();
+
+    try hash_file.writeAll(sdl_hash);
+}
+
+fn getDependencyHash(b: *std.Build, name: []const u8) ![]const u8 {
+    for (b.available_deps) |dep| {
+        if (std.mem.eql(u8, dep[0], name)) return dep[1];
+    }
+    return error.DependencyHashNotFound;
 }
 
 fn prepareExternal(build_root: std.fs.Dir) !void {

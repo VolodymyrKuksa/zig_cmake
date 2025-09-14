@@ -8,6 +8,14 @@
 
     // Should I just place the vendored deps here??
     .dependencies = .{
+        .sdl = .{
+            .url = "git+https://github.com/libsdl-org/SDL.git#4561be89a5163aa393788be83bec99c7c49f6f27",
+            .hash = "N-V-__8AANzyngNgkUKzvLcn7p8LqFBrUMFlkl_snV7jD-bh",
+        },
+        .sdl_shadercross = .{
+            .url = "git+https://github.com/libsdl-org/SDL_shadercross.git#4ce748310f57d405b4eb2a79fbbc7e974d6491ec",
+            .hash = "N-V-__8AAK6dBgDKzOL6Kc6ci8hWG6YydwPBNWxAiY70xGeG",
+        },
     },
 
     .paths = .{

@@ -1,4 +1,5 @@
 external/*
+ext/*
 
 # zig
 .zig-cache/*
