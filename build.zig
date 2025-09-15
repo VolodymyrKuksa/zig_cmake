@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) !void {
         std.debug.print("{s:>20}: {s}\n", .{ dep[0], dep[1] });
     }
 
+    b.build_root.handle.makePath("ext") catch |err| {
+        switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        }
+    };
     var ext_dir = b.build_root.handle.openDir("ext", .{}) catch unreachable;
     defer ext_dir.close();
 
@@ -42,7 +48,7 @@ pub fn build(b: *std.Build) !void {
     sc_mod.addIncludePath(b.path(cmake_deps.sdl_include_path));
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_lib_path));
     sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_include_path));
-    sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_lib_path));
+    sc_mod.addLibraryPath(b.path(cmake_deps.sdl_shadercross_lib_path));
     sc_mod.addLibraryPath(b.path("zig-out/ext/")); // TODO: fixme
 
     sc_mod.linkSystemLibrary("SDL3.0", .{ .needed = true });
