@@ -45,11 +45,18 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
 
+    const build_root = try b.build_root.handle.realpathAlloc(gpa.allocator(), ".");
+    defer gpa.allocator().free(build_root);
+    const ext_install_dir = try std.fmt.allocPrint(gpa.allocator(), "{s}/ext/", .{b.install_prefix});
+    defer gpa.allocator().free(ext_install_dir);
+    const ext_install_subdir = try std.fs.path.relative(gpa.allocator(), build_root, ext_install_dir);
+    defer gpa.allocator().free(ext_install_subdir);
+
     sc_mod.addIncludePath(b.path(cmake_deps.sdl_include_path));
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_lib_path));
     sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_include_path));
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_shadercross_lib_path));
-    sc_mod.addLibraryPath(b.path("zig-out/ext/")); // TODO: fixme
+    sc_mod.addLibraryPath(b.path(ext_install_subdir));
 
     sc_mod.linkSystemLibrary("SDL3.0", .{ .needed = true });
     sc_mod.linkSystemLibrary("SDL3_shadercross", .{ .needed = true });
