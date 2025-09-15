@@ -1,23 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// What happens if this is imported like a zig dependency?
-// TODO: The git submodules cannot be fetched if we publish this module as zig dependency.
-// Try adding the vendored dependencies via 'zig fetch --save=name url' instead.
+pub fn build(b: *std.Build) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
 
-// How to properly package the executable and libraries to ship to other users?
-
-// The idea is to generate and compile CMake dependencies when build.zig is invoked.
-// Steps:
-// - Grab hashes of the dependencies from the std.Build instance
-// - If hashes are up to date (match the ones in version.txt) skip to the zig module creation step
-// - Create build directory inside the fetched dependency (or in the current mosule subdir)
-// - Generate CMake projects for all needed targets and optimization options
-// - Build CMake generated projects
-// - Write dependency hashes into a version file to avoid recompilation next time
-// - Create zig module that linkes against the pre-built CMake dependencies
-
-pub fn build(b: *std.Build) void {
     std.debug.print("install prefix: \"{s}\"\n", .{b.install_prefix});
     std.debug.print("build root: \"{?s}\"\n", .{b.build_root.path});
 
@@ -28,6 +15,10 @@ pub fn build(b: *std.Build) void {
     const sdl_dep_path = sdl_dep.path(".").getPath(b);
     std.debug.print("SDL Dependency path: {s}\n", .{sdl_dep_path});
 
+    const sdl_shadercross_dep = b.dependency("sdl_shadercross", .{ .target = target, .optimize = optimize });
+    const sdl_shadercross_dep_path = sdl_shadercross_dep.path(".").getPath(b);
+    std.debug.print("SDL_shadercross Dependency path: {s}\n", .{sdl_shadercross_dep_path});
+
     std.debug.print("Dependency hashes:\n", .{});
     for (b.available_deps) |dep| {
         std.debug.print("{s:>20}: {s}\n", .{ dep[0], dep[1] });
@@ -36,17 +27,10 @@ pub fn build(b: *std.Build) void {
     var ext_dir = b.build_root.handle.openDir("ext", .{}) catch unreachable;
     defer ext_dir.close();
 
-    prepareExternalDeps(b, .{
-        .target = target,
-        .optimize = optimize,
-        .ext_dir = ext_dir,
-    }) catch |err| {
+    var cmake_deps = prepareExternal(gpa.allocator(), b, target, optimize, ext_dir) catch |err| {
         std.debug.panic("Failed to prepare external dependencies: {}", .{err});
     };
-
-    prepareExternal(b.build_root.handle) catch |err| {
-        std.debug.panic("Failed to prepare external: {}", .{err});
-    };
+    defer cmake_deps.deinit(gpa.allocator());
 
     const sc_mod = b.addModule("SDL_shadercross", .{
         .target = target,
@@ -55,27 +39,29 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    sc_mod.addIncludePath(b.path("external/SDL/include/"));
-    sc_mod.addIncludePath(b.path("external/SDL_shadercross/include/"));
-    sc_mod.addLibraryPath(b.path("external/SDL/lib/"));
-    sc_mod.addLibraryPath(b.path("external/SDL_shadercross/lib/"));
+    sc_mod.addIncludePath(b.path(cmake_deps.sdl_include_path));
+    sc_mod.addLibraryPath(b.path(cmake_deps.sdl_lib_path));
+    sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_include_path));
+    sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_lib_path));
+    sc_mod.addLibraryPath(b.path("zig-out/ext/")); // TODO: fixme
 
     sc_mod.linkSystemLibrary("SDL3.0", .{ .needed = true });
     sc_mod.linkSystemLibrary("SDL3_shadercross", .{ .needed = true });
     sc_mod.linkSystemLibrary("dxcompiler", .{ .needed = true });
-    sc_mod.linkSystemLibrary("spirv-cross-c-shared.0.64.0", .{ .needed = true });
+    sc_mod.linkSystemLibrary("spirv-cross-c-shared.0.67.0", .{ .needed = true });
 
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
     b.installFile(
-        "external/SDL/lib/libSDL3.0.dylib",
-        "external/libSDL3.0.dylib",
+        try std.fmt.bufPrint(&buf, "{s}/libSDL3.0.dylib", .{cmake_deps.sdl_lib_path}),
+        "ext/libSDL3.0.dylib",
     );
     b.installFile(
-        "external/SDL_shadercross/lib/libdxcompiler.dylib",
-        "external/libdxcompiler.dylib",
+        try std.fmt.bufPrint(&buf, "{s}/libdxcompiler.dylib", .{cmake_deps.sdl_shadercross_lib_path}),
+        "ext/libdxcompiler.dylib",
     );
     b.installFile(
-        "external/SDL_shadercross/lib/libspirv-cross-c-shared.0.64.0.dylib",
-        "external/libspirv-cross-c-shared.0.64.0.dylib",
+        try std.fmt.bufPrint(&buf, "{s}/libspirv-cross-c-shared.0.67.0.dylib", .{cmake_deps.sdl_shadercross_lib_path}),
+        "ext/libspirv-cross-c-shared.0.dylib",
     );
 
     ////////////////////////////// APP /////////////////////////////////////////////////////////////
@@ -110,6 +96,7 @@ pub fn build(b: *std.Build) void {
         .filters = filters,
     });
     const run_tests = b.addRunArtifact(tests);
+    run_tests.step.dependOn(b.getInstallStep());
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
@@ -119,26 +106,145 @@ const ExternalOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     ext_dir: std.fs.Dir,
+    dependency: []const u8,
+    ext_subdir: []const u8,
+    include_subdir: ?[]const u8 = null,
+    copy_bin: bool = false,
+    additional_cmake_generate_options: []const []const u8 = &.{},
 };
 
-fn prepareExternalDeps(b: *std.Build, opts: ExternalOptions) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+const CMakeDependencies = struct {
+    fn init(
+        allocator: std.mem.Allocator,
+        sdl_include_path: []const u8,
+        sdl_lib_path: []const u8,
+        sdl_shadercross_include_path: []const u8,
+        sdl_shadercross_lib_path: []const u8,
+    ) !CMakeDependencies {
+        return .{
+            .sdl_include_path = try allocator.dupe(u8, sdl_include_path),
+            .sdl_lib_path = try allocator.dupe(u8, sdl_lib_path),
+            .sdl_shadercross_include_path = try allocator.dupe(u8, sdl_shadercross_include_path),
+            .sdl_shadercross_lib_path = try allocator.dupe(u8, sdl_shadercross_lib_path),
+        };
+    }
 
-    try generateAndBuildSDL(gpa.allocator(), b, opts);
+    fn deinit(self: *CMakeDependencies, allocator: std.mem.Allocator) void {
+        allocator.free(self.sdl_include_path);
+        allocator.free(self.sdl_lib_path);
+        allocator.free(self.sdl_shadercross_include_path);
+        allocator.free(self.sdl_shadercross_lib_path);
+    }
+
+    sdl_include_path: []const u8,
+    sdl_lib_path: []const u8,
+    sdl_shadercross_include_path: []const u8,
+    sdl_shadercross_lib_path: []const u8,
+};
+
+fn prepareExternal(
+    allocator: std.mem.Allocator,
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ext_dir: std.fs.Dir,
+) !CMakeDependencies {
+    var sdl_info = try generateAndBuildCMakeDependency(allocator, b, .{
+        .target = target,
+        .optimize = optimize,
+        .ext_dir = ext_dir,
+        .dependency = "sdl",
+        .ext_subdir = "SDL",
+        .include_subdir = "include/SDL3",
+    });
+    defer sdl_info.deinit(allocator);
+
+    const sdl_dir_opt = try std.fmt.allocPrint(allocator, "-DSDL3_DIR={s}", .{
+        sdl_info.build_path,
+    });
+    defer allocator.free(sdl_dir_opt);
+
+    download_external: {
+        const shadercross_dep = b.dependency("sdl_shadercross", .{});
+        const shadercross_path = shadercross_dep.path(".").getPath(b);
+        var shadercross_dir = try std.fs.openDirAbsolute(shadercross_path, .{});
+        defer shadercross_dir.close();
+        const download_script = shadercross_dir.realpathAlloc(allocator, "external/download.sh") catch {
+            break :download_external;
+        };
+        defer allocator.free(download_script);
+        std.fs.accessAbsolute(download_script, .{}) catch {
+            break :download_external;
+        };
+        var download = std.process.Child.init(&.{download_script}, allocator);
+        download.cwd_dir = shadercross_dir;
+        _ = try download.spawnAndWait();
+    }
+
+    var shadercross_info = try generateAndBuildCMakeDependency(allocator, b, .{
+        .target = target,
+        .optimize = optimize,
+        .ext_dir = ext_dir,
+        .dependency = "sdl_shadercross",
+        .ext_subdir = "SDL_shadercross",
+        .include_subdir = "include/SDL3_shadercross",
+        .copy_bin = true,
+        .additional_cmake_generate_options = &.{
+            sdl_dir_opt,
+            "-DSDLSHADERCROSS_VENDORED=ON",
+        },
+    });
+    defer shadercross_info.deinit(allocator);
+
+    return try .init(
+        allocator,
+        sdl_info.ext_include_path.?,
+        sdl_info.ext_lib_path,
+        shadercross_info.ext_include_path.?,
+        shadercross_info.ext_lib_path,
+    );
 }
 
-fn generateAndBuildSDL(allocator: std.mem.Allocator, b: *std.Build, opts: ExternalOptions) !void {
+const CMakeDependencyInfo = struct {
+    fn init(
+        allocator: std.mem.Allocator,
+        build_path: []const u8,
+        ext_include_path: ?[]const u8,
+        ext_lib_path: []const u8,
+    ) !CMakeDependencyInfo {
+        return .{
+            .build_path = try allocator.dupe(u8, build_path),
+            .ext_include_path = if (ext_include_path) |path| try allocator.dupe(u8, path) else null,
+            .ext_lib_path = try allocator.dupe(u8, ext_lib_path),
+        };
+    }
+
+    fn deinit(self: *CMakeDependencyInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.build_path);
+        if (self.ext_include_path) |include_path| {
+            allocator.free(include_path);
+        }
+        allocator.free(self.ext_lib_path);
+    }
+
+    build_path: []const u8,
+    ext_include_path: ?[]const u8,
+    ext_lib_path: []const u8,
+};
+
+fn generateAndBuildCMakeDependency(
+    allocator: std.mem.Allocator,
+    b: *std.Build,
+    opts: ExternalOptions,
+) !CMakeDependencyInfo {
     if (opts.target.result.os.tag != builtin.target.os.tag or
         opts.target.result.cpu.arch != builtin.target.cpu.arch)
     {
         return error.CrossCompilationNotSupported;
     }
-    const sdl_dep = b.dependency("sdl", .{});
-    const sdl_path = sdl_dep.path(".").getPath(b);
-    var sdl_dir = try std.fs.openDirAbsolute(sdl_path, .{});
-    defer sdl_dir.close();
-    const sdl_hash = try getDependencyHash(b, "sdl");
+
+    const dep_hash = try getDependencyHash(b, opts.dependency);
+
     const triple = try opts.target.result.zigTriple(allocator);
     defer allocator.free(triple);
     const triple_mod = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
@@ -146,18 +252,98 @@ fn generateAndBuildSDL(allocator: std.mem.Allocator, b: *std.Build, opts: Extern
         @tagName(opts.optimize),
     });
     defer allocator.free(triple_mod);
+    const ext_subpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+        opts.ext_subdir,
+        triple_mod,
+    });
+    defer allocator.free(ext_subpath);
+    const hash_subpath = try std.fmt.allocPrint(allocator, "{s}/hash.txt", .{ext_subpath});
+    defer allocator.free(hash_subpath);
+
+    const dependency = b.dependency(opts.dependency, .{});
+    const dep_path = dependency.path(".").getPath(b);
+    var dep_dir = try std.fs.openDirAbsolute(dep_path, .{});
+    defer dep_dir.close();
     var build_dir = blk: {
         const relpath = try std.fmt.allocPrint(allocator, "build/{s}", .{triple_mod});
         defer allocator.free(relpath);
-        sdl_dir.makePath(relpath) catch |err| switch (err) {
+        dep_dir.makePath(relpath) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
-        break :blk try sdl_dir.openDir(relpath, .{});
+        break :blk try dep_dir.openDir(relpath, .{});
     };
     defer build_dir.close();
     const build_path = try build_dir.realpathAlloc(allocator, ".");
     defer allocator.free(build_path);
+
+    var inc_path: ?[]const u8 = null;
+    if (opts.include_subdir) |include_subdir| {
+        inc_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+            ext_subpath,
+            include_subdir,
+        });
+    }
+    defer {
+        if (inc_path) |path| {
+            allocator.free(path);
+        }
+    }
+
+    const ext_lib_path = try std.fmt.allocPrint(allocator, "{s}/lib", .{ext_subpath});
+    defer allocator.free(ext_lib_path);
+
+    const build_root = try b.build_root.handle.realpathAlloc(allocator, ".");
+    defer allocator.free(build_root);
+
+    var info: CMakeDependencyInfo = undefined;
+    {
+        var inc_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var lib_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+        var rel_inc_path: ?[]const u8 = null;
+        if (inc_path) |include_path| {
+            opts.ext_dir.makePath(include_path) catch |err| {
+                switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                }
+            };
+            const abs_path = try opts.ext_dir.realpathAlloc(allocator, include_path);
+            defer allocator.free(abs_path);
+            const rel_path = try std.fs.path.relative(allocator, build_root, abs_path);
+            defer allocator.free(rel_path);
+            const base = std.fs.path.dirname(rel_path) orelse return error.InvalidIncludePath;
+            std.mem.copyForwards(u8, &inc_buf, base);
+            rel_inc_path = inc_buf[0..base.len];
+        }
+        opts.ext_dir.makePath(ext_lib_path) catch |err| {
+            switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            }
+        };
+        const abs_path = try opts.ext_dir.realpathAlloc(allocator, ext_lib_path);
+        defer allocator.free(abs_path);
+        const rel_path = try std.fs.path.relative(allocator, build_root, abs_path);
+        defer allocator.free(rel_path);
+        std.mem.copyForwards(u8, &lib_buf, rel_path);
+        const lib_path = lib_buf[0..rel_path.len];
+
+        info = try .init(allocator, build_path, rel_inc_path, lib_path);
+    }
+
+    const should_rebuild = blk: {
+        var hash_file = opts.ext_dir.openFile(hash_subpath, .{}) catch break :blk true;
+        defer hash_file.close();
+        const contents = try hash_file.readToEndAlloc(allocator, 2048);
+        defer allocator.free(contents);
+        break :blk !std.mem.eql(u8, dep_hash, contents);
+    };
+    if (!should_rebuild) {
+        std.debug.print("CMake dependency up to date - {s}\n", .{opts.dependency});
+        return info;
+    }
 
     const cmake_build_type = switch (opts.optimize) {
         .Debug => "Debug",
@@ -172,10 +358,26 @@ fn generateAndBuildSDL(allocator: std.mem.Allocator, b: *std.Build, opts: Extern
     );
     defer allocator.free(cmake_build_type_option);
 
-    var cmake_generate = std.process.Child.init(
-        &.{ "cmake", cmake_build_type_option, "-S", sdl_path, "-B", build_path },
-        allocator,
-    );
+    const default_options: []const []const u8 = &.{
+        "cmake",
+        cmake_build_type_option,
+        "-S",
+        dep_path,
+        "-B",
+        build_path,
+    };
+    var all_options = try allocator.alloc([]const u8, default_options.len +
+        opts.additional_cmake_generate_options.len);
+    defer allocator.free(all_options);
+
+    for (default_options, 0..) |option, i| {
+        all_options[i] = option;
+    }
+    for (opts.additional_cmake_generate_options, 0..) |option, i| {
+        all_options[default_options.len + i] = option;
+    }
+
+    var cmake_generate = std.process.Child.init(all_options, allocator);
     const generate_term = try cmake_generate.spawnAndWait();
     if (std.meta.activeTag(generate_term) != .Exited or generate_term.Exited != 0) {
         return error.CMakeGenerateFailed;
@@ -190,30 +392,43 @@ fn generateAndBuildSDL(allocator: std.mem.Allocator, b: *std.Build, opts: Extern
         return error.CMakeBuildFailed;
     }
 
-    try opts.ext_dir.deleteTree("SDL");
+    try opts.ext_dir.deleteTree(ext_subpath);
 
-    const ext_sdl_path = try std.fmt.allocPrint(allocator, "SDL/{s}", .{triple_mod});
-    defer allocator.free(ext_sdl_path);
-    const lib_path = try std.fmt.allocPrint(allocator, "{s}/lib", .{ext_sdl_path});
-    defer allocator.free(lib_path);
-    const inc_path = try std.fmt.allocPrint(allocator, "{s}/include/SDL3", .{ext_sdl_path});
-    defer allocator.free(inc_path);
+    {
+        try copyDir(allocator, build_dir, ".", opts.ext_dir, ext_lib_path, .{
+            .include_extensions = &.{
+                opts.target.result.dynamicLibSuffix(),
+                opts.target.result.staticLibSuffix(),
+            },
+            .verbose = true,
+            .recursive = true,
+            .mirror_source_directory_tree = false,
+        });
+    }
 
-    try copyDir(allocator, build_dir, ".", opts.ext_dir, lib_path, .{
-        .include_extensions = &.{opts.target.result.dynamicLibSuffix()},
-        .verbose = true,
-    });
-    try copyDir(allocator, sdl_dir, "include/SDL3", opts.ext_dir, inc_path, .{
-        .verbose = true,
-        .recursive = true,
-    });
+    if (opts.copy_bin) {
+        const bin_subpath = try std.fmt.allocPrint(allocator, "{s}/bin", .{ext_subpath});
+        defer allocator.free(bin_subpath);
+        try copyDir(allocator, build_dir, ".", opts.ext_dir, bin_subpath, .{
+            .exclude_filenames = &.{"Makefile"},
+            .include_extensions = &.{opts.target.result.exeFileExt()},
+            .verbose = true,
+        });
+    }
 
-    const hash_path = try std.fmt.allocPrint(allocator, "{s}/hash.txt", .{ext_sdl_path});
-    defer allocator.free(hash_path);
-    var hash_file = try opts.ext_dir.createFile(hash_path, .{});
+    if (inc_path) |include_path| {
+        try copyDir(allocator, dep_dir, opts.include_subdir.?, opts.ext_dir, include_path, .{
+            .verbose = true,
+            .recursive = true,
+        });
+    }
+
+    var hash_file = try opts.ext_dir.createFile(hash_subpath, .{});
     defer hash_file.close();
 
-    try hash_file.writeAll(sdl_hash);
+    try hash_file.writeAll(dep_hash);
+
+    return info;
 }
 
 fn getDependencyHash(b: *std.Build, name: []const u8) ![]const u8 {
@@ -223,212 +438,8 @@ fn getDependencyHash(b: *std.Build, name: []const u8) ![]const u8 {
     return error.DependencyHashNotFound;
 }
 
-fn prepareExternal(build_root: std.fs.Dir) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    // TODO: use
-    var vendor_dir = try build_root.openDir("vendor", .{});
-    defer vendor_dir.close();
-
-    // Debug
-    const vendor_path = try vendor_dir.realpathAlloc(gpa.allocator(), ".");
-    defer gpa.allocator().free(vendor_path);
-    std.debug.print("vendor path: {s}\n", .{vendor_path});
-
-    build_root.makePath("external") catch |err| {
-        switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        }
-    };
-    var external_dir = try build_root.openDir("external", .{});
-    defer external_dir.close();
-
-    var vendor_version = try vendor_dir.openFile("version.txt", .{});
-    defer vendor_version.close();
-
-    // Compare version files to figure out if we need to rebuild dependencies.
-    const should_rebuild = blk: {
-        var external_version = external_dir.openFile("version.txt", .{}) catch |err| {
-            switch (err) {
-                error.FileNotFound => break :blk true,
-                else => return err,
-            }
-        };
-        defer external_version.close();
-
-        const ven_content = try vendor_version.readToEndAlloc(gpa.allocator(), 6000);
-        defer gpa.allocator().free(ven_content);
-        const ext_content = try external_version.readToEndAlloc(gpa.allocator(), 6000);
-        defer gpa.allocator().free(ext_content);
-        break :blk !std.mem.eql(u8, ven_content, ext_content);
-    };
-
-    if (should_rebuild) {
-        std.debug.print("external/version.txt is outdated, rebuilding vendored dependencies\n", .{});
-
-        // Update submodules
-        var git_submodule_update = std.process.Child.init(
-            &.{ "git", "submodule", "update", "--init", "--recursive" },
-            gpa.allocator(),
-        );
-        const update_term = try git_submodule_update.spawnAndWait();
-        if (std.meta.activeTag(update_term) != .Exited or update_term.Exited != 0) {
-            return error.SubmoduleUpdateFailed;
-        }
-
-        try buildSDL(gpa.allocator(), vendor_dir, external_dir);
-        try buildSDLShadercross(gpa.allocator(), vendor_dir, external_dir);
-
-        try vendor_dir.copyFile("version.txt", external_dir, "version.txt", .{});
-    } else {
-        std.debug.print("external/version.txt is up to date, skipping vendored dependencies rebuild\n", .{});
-    }
-}
-
-fn buildSDL(allocator: std.mem.Allocator, vendor_dir: std.fs.Dir, external_dir: std.fs.Dir) !void {
-    var sdl_src_dir = try vendor_dir.openDir("SDL", .{});
-    defer sdl_src_dir.close();
-    sdl_src_dir.makeDir("build") catch |err| {
-        switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        }
-    };
-
-    var build_dir = try sdl_src_dir.openDir("build", .{});
-    defer build_dir.close();
-
-    const src_path = try sdl_src_dir.realpathAlloc(allocator, ".");
-    defer allocator.free(src_path);
-    const build_path = try sdl_src_dir.realpathAlloc(allocator, "build");
-    defer allocator.free(build_path);
-
-    var cmake_generate = std.process.Child.init(
-        &.{ "cmake", "-S", src_path, "-B", build_path },
-        allocator,
-    );
-    const generate_term = try cmake_generate.spawnAndWait();
-    if (std.meta.activeTag(generate_term) != .Exited or generate_term.Exited != 0) {
-        return error.CMakeGenerateFailed;
-    }
-
-    var cmake_build = std.process.Child.init(
-        &.{ "cmake", "--build", build_path, "-j", "16" },
-        allocator,
-    );
-    const build_term = try cmake_build.spawnAndWait();
-    if (std.meta.activeTag(build_term) != .Exited or build_term.Exited != 0) {
-        return error.CMakeBuildFailed;
-    }
-
-    try external_dir.deleteTree("SDL");
-
-    try copyDir(allocator, sdl_src_dir, "build", external_dir, "SDL/lib", .{
-        .include_extensions = &.{".dylib"},
-        .verbose = true,
-    });
-    try copyDir(allocator, sdl_src_dir, "include", external_dir, "SDL/include", .{
-        .verbose = true,
-        .recursive = true,
-    });
-}
-
-fn buildSDLShadercross(allocator: std.mem.Allocator, vendor_dir: std.fs.Dir, external_dir: std.fs.Dir) !void {
-    vendor_dir.makePath("SDL_shadercross/build") catch |err| {
-        switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        }
-    };
-
-    const sdl_build_path = try vendor_dir.realpathAlloc(allocator, "SDL/build");
-    defer allocator.free(sdl_build_path);
-    const sdl_cmake_opt = try std.fmt.allocPrint(allocator, "-DSDL3_DIR={s}", .{sdl_build_path});
-    defer allocator.free(sdl_cmake_opt);
-    const src_path = try vendor_dir.realpathAlloc(allocator, "SDL_shadercross");
-    defer allocator.free(src_path);
-    const build_path = try vendor_dir.realpathAlloc(allocator, "SDL_shadercross/build");
-    defer allocator.free(build_path);
-
-    var cmake_generate = std.process.Child.init(
-        &.{
-            "cmake",
-            "-S",
-            src_path,
-            "-B",
-            build_path,
-            sdl_cmake_opt,
-            "-DSDLSHADERCROSS_VENDORED=ON",
-            "-DSDLSHADERCROSS_STATIC=ON",
-            "-DSDLSHADERCROSS_SHARED=OFF",
-        },
-        allocator,
-    );
-    const generate_term = try cmake_generate.spawnAndWait();
-    if (std.meta.activeTag(generate_term) != .Exited or generate_term.Exited != 0) {
-        return error.CMakeGenerateFailed;
-    }
-
-    var cmake_build = std.process.Child.init(
-        &.{ "cmake", "--build", build_path, "-j", "16" },
-        allocator,
-    );
-    const build_term = try cmake_build.spawnAndWait();
-    if (std.meta.activeTag(build_term) != .Exited or build_term.Exited != 0) {
-        return error.CMakeBuildFailed;
-    }
-
-    try external_dir.deleteTree("SDL_shadercross");
-
-    try copyDir(
-        allocator,
-        vendor_dir,
-        "SDL_shadercross/build",
-        external_dir,
-        "SDL_shadercross/lib",
-        .{ .include_extensions = &.{".a"}, .verbose = true },
-    );
-    try copyDir(
-        allocator,
-        vendor_dir,
-        "SDL_shadercross/build/external",
-        external_dir,
-        "SDL_shadercross/lib",
-        .{
-            .include_extensions = &.{".dylib"},
-            .verbose = true,
-            .recursive = true,
-            .mirror_source_directory_tree = false,
-        },
-    );
-    const libspirv_realpath = try external_dir.realpathAlloc(
-        allocator,
-        "SDL_shadercross/lib/libspirv-cross-c-shared.0.64.0.dylib",
-    );
-    defer allocator.free(libspirv_realpath);
-    try external_dir.symLink(
-        libspirv_realpath,
-        "SDL_shadercross/lib/libspirv-cross-c-shared.0.dylib",
-        .{},
-    );
-    try copyDir(
-        allocator,
-        vendor_dir,
-        "SDL_shadercross/include",
-        external_dir,
-        "SDL_shadercross/include",
-        .{ .verbose = true, .recursive = true },
-    );
-
-    var bin_dir = try external_dir.makeOpenPath("SDL_shadercross/bin", .{});
-    defer bin_dir.close();
-
-    try vendor_dir.copyFile("SDL_shadercross/build/shadercross", bin_dir, "shadercross", .{});
-}
-
 const CopyDirOpt = struct {
+    exclude_filenames: []const []const u8 = &.{},
     include_extensions: []const []const u8 = &.{},
     mirror_source_directory_tree: bool = true,
     recursive: bool = false,
@@ -476,7 +487,12 @@ fn copyDir(
         }
     } else {
         var it = src.iterate();
-        while (try it.next()) |entry| {
+        outer: while (try it.next()) |entry| {
+            for (options.exclude_filenames) |excluded_name| {
+                if (std.mem.eql(u8, excluded_name, entry.name)) {
+                    continue :outer;
+                }
+            }
             switch (entry.kind) {
                 .file => try copyFile(
                     entry.name,
