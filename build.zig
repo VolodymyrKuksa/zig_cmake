@@ -5,24 +5,8 @@ pub fn build(b: *std.Build) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    std.debug.print("install prefix: \"{s}\"\n", .{b.install_prefix});
-    std.debug.print("build root: \"{?s}\"\n", .{b.build_root.path});
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    const sdl_dep = b.dependency("sdl", .{ .target = target, .optimize = optimize });
-    const sdl_dep_path = sdl_dep.path(".").getPath(b);
-    std.debug.print("SDL Dependency path: {s}\n", .{sdl_dep_path});
-
-    const sdl_shadercross_dep = b.dependency("sdl_shadercross", .{ .target = target, .optimize = optimize });
-    const sdl_shadercross_dep_path = sdl_shadercross_dep.path(".").getPath(b);
-    std.debug.print("SDL_shadercross Dependency path: {s}\n", .{sdl_shadercross_dep_path});
-
-    std.debug.print("Dependency hashes:\n", .{});
-    for (b.available_deps) |dep| {
-        std.debug.print("{s:>20}: {s}\n", .{ dep[0], dep[1] });
-    }
 
     b.build_root.handle.makePath("ext") catch |err| {
         switch (err) {
@@ -177,6 +161,7 @@ fn prepareExternal(
     });
     defer allocator.free(sdl_dir_opt);
 
+    // Check if already downloaded?
     download_external: {
         const shadercross_dep = b.dependency("sdl_shadercross", .{});
         const shadercross_path = shadercross_dep.path(".").getPath(b);
@@ -542,7 +527,6 @@ fn copyFile(
         break :blk false;
     };
     if (should_copy) {
-        // const dirpath = entry.path[0 .. entry.path.len - entry.basename.len];
         if (mirror_source_directory_tree) {
             dst.makePath(dir_path) catch |err| {
                 switch (err) {
