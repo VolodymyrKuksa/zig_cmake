@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) !void {
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_lib_path));
     sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_include_path));
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_shadercross_lib_path));
+    std.debug.print("Ext install subdir: {s}\n", .{ext_install_subdir});
     sc_mod.addLibraryPath(b.path(ext_install_subdir));
 
     sc_mod.linkSystemLibrary("SDL3.0", .{ .needed = true });
