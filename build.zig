@@ -40,8 +40,7 @@ pub fn build(b: *std.Build) !void {
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_lib_path));
     sc_mod.addIncludePath(b.path(cmake_deps.sdl_shadercross_include_path));
     sc_mod.addLibraryPath(b.path(cmake_deps.sdl_shadercross_lib_path));
-    std.debug.print("Ext install subdir: {s}\n", .{ext_install_subdir});
-    sc_mod.addLibraryPath(b.path(ext_install_subdir));
+    // sc_mod.addLibraryPath(b.path(ext_install_subdir));
 
     sc_mod.linkSystemLibrary("SDL3.0", .{ .needed = true });
     sc_mod.linkSystemLibrary("SDL3_shadercross", .{ .needed = true });
@@ -61,6 +60,15 @@ pub fn build(b: *std.Build) !void {
         try std.fmt.bufPrint(&buf, "{s}/libspirv-cross-c-shared.0.67.0.dylib", .{cmake_deps.sdl_shadercross_lib_path}),
         "ext/libspirv-cross-c-shared.0.dylib",
     );
+
+    std.debug.print("Ext install subdir: {s}\n", .{ext_install_subdir});
+    // We have to create the path to ensure that the add library path function does not fail
+    std.fs.cwd().makePath(ext_install_subdir) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            return err;
+        }
+    };
+    sc_mod.addLibraryPath(b.path(ext_install_subdir));
 
     ////////////////////////////// APP /////////////////////////////////////////////////////////////
     const app_mod = b.createModule(.{
